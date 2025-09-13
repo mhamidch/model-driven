@@ -224,64 +224,107 @@ export async function clearLookup(page: Page, label: string) {
 }
 
 /* ---------------------------------- date --------------------------------- */
+// --- replace your existing setDate + helpers with this block ---
 
-export type TargetDate = string | Date; // accepts "dd/MM/yyyy", "yyyy-MM-dd", or Date
+import { Page, Locator, expect } from '@playwright/test';
 
+const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const labelRx = (label: string) => new RegExp(`^${esc(label)}(\\s*\\*)?$`, 'i'); // allow required asterisk
+
+type TargetDate = string | Date;
+
+/** Parse "dd/MM/yyyy", "yyyy-MM-dd", or Date into a Date */
 function parseDateLoose(input: TargetDate): Date {
   if (input instanceof Date) return input;
   const s = input.trim();
 
-  // Try ISO yyyy-MM-dd
-  const dIso = Date.parse(s);
-  if (!Number.isNaN(dIso) && /^\d{4}-\d{2}-\d{2}/.test(s)) return new Date(dIso);
-
-  // Try dd/MM/yyyy
-  const m = /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/.exec(s);
-  if (m) {
-    const dd = Number(m[1]), mm = Number(m[2]), yyyy = Number(m[3]);
-    return new Date(yyyy, mm - 1, dd);
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+    const t = Date.parse(s);
+    if (!Number.isNaN(t)) return new Date(t);
   }
-  throw new Error(`Unrecognized date "${input}". Use dd/MM/yyyy, yyyy-MM-dd, or Date.`);
+  const m = /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/.exec(s);
+  if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+  throw new Error(`Unrecognized date "${input}". Use dd/MM/yyyy or yyyy-MM-dd.`);
 }
 
-export async function setDate(page: Page, label: string, value: TargetDate) {
-  const target = parseDateLoose(value);
+/** Try to locate an editable input for a date field OR the combobox container */
+async function findDateHandles(page: Page, label: string): Promise<{
+  editableInput?: Locator;   // if present, we can type/verify here
+  comboOrText: Locator;      // main control (textbox or combobox)
+  openButton: Locator;       // button that opens the calendar
+}> {
+  // 1) Prefer a visible textbox by accessible name (many tenants still use this)
+  let tb = page.getByRole('textbox', { name: labelRx(label) }).first();
 
-  // Many UCI date fields are textboxes with an adjacent "Open the calendar" button
-  const tb = await findTextbox(page, label);
-  await tb.click();
-
-  // Open calendar via adjacent button or keyboard
-  let openBtn = tb.locator('xpath=following::button[contains(@aria-label,"calendar")][1]').first();
-  if (!(await openBtn.count())) {
-    openBtn = page.getByRole('button', { name: /open.*calendar|calendar|show calendar/i }).first();
+  if (await tb.isVisible().catch(() => false)) {
+    // calendar button is usually adjacent or a generic "Calendar" button
+    let openBtn = tb.locator('xpath=following::button[contains(@aria-label,"calendar")][1]').first();
+    if (!(await openBtn.count())) {
+      openBtn = page.getByRole('button', { name: /open.*calendar|calendar|show calendar/i }).first();
+    }
+    return { editableInput: tb, comboOrText: tb, openButton: openBtn };
   }
-  await openBtn.click();
 
+  // 2) Combobox by accessible label (common for date fields in UCI)
+  const comboByRole = page.getByRole('combobox', { name: labelRx(label) }).first();
+  if (await comboByRole.isVisible().catch(() => false)) {
+    // Some combos have an inner input; grab it if present
+    const innerInput = comboByRole.locator('input[type="text"], input[role="spinbutton"], input').first();
+    const editable = (await innerInput.count()) ? innerInput : undefined;
+
+    // Find calendar button near the combobox
+    let openBtn = comboByRole.locator('button[aria-label*="calendar" i], button[title*="calendar" i]').first();
+    if (!(await openBtn.count())) {
+      // try a nearby button in the same field container
+      openBtn = comboByRole.locator('xpath=following::button[contains(@aria-label,"calendar")][1]').first()
+        .or(page.getByRole('button', { name: /open.*calendar|calendar|show calendar/i }).first());
+    }
+
+    return { editableInput: editable, comboOrText: comboByRole, openButton: openBtn };
+  }
+
+  // 3) Last chance: aria-label container + descendants
+  const container = page.locator(`[aria-label="${label}"], [aria-label^="${label},"]`).first();
+  if (await container.isVisible().catch(() => false)) {
+    const maybeInput = container.locator('input').first();
+    const openBtn = container.locator('button[aria-label*="calendar" i], button[title*="calendar" i]').first()
+      .or(page.getByRole('button', { name: /open.*calendar|calendar|show calendar/i }).first());
+    return {
+      editableInput: (await maybeInput.count()) ? maybeInput : undefined,
+      comboOrText: (await maybeInput.count()) ? maybeInput : container,
+      openButton: openBtn
+    };
+  }
+
+  throw new Error(`Could not find date control for label "${label}". It may be renamed or inside a dialog.`);
+}
+
+/** Navigate the calendar popup to the desired month/year and click the day */
+async function pickFromCalendar(page: Page, target: Date) {
+  // Calendar is usually a dialog containing a grid
   const cal = page.getByRole('dialog').filter({ has: page.locator('[role="grid"]') }).first()
-             .or(page.locator('.ms-DatePicker, .DatePicker').first());
-  await expect(cal).toBeVisible();
+    .or(page.locator('.ms-DatePicker, .DatePicker').first());
+  await expect(cal).toBeVisible({ timeout: 10_000 });
 
   const header = cal.locator('[role="heading"], .ms-DatePicker-monthAndYear, .DatePicker-monthAndYear').first();
   const next = cal.getByRole('button', { name: /next month|go to next month/i }).first();
   const prev = cal.getByRole('button', { name: /previous month|go to previous month/i }).first();
 
   const want = new Date(target.getFullYear(), target.getMonth(), 1);
-  const [long, short] = monthYearText(target);
+  const long = target.toLocaleString('en-AU', { month: 'long', year: 'numeric' });
+  const short = target.toLocaleString('en-AU', { month: 'short', year: 'numeric' });
 
-  // Try to parse current header month to compute bounded hops
+  // Try bounded hops
   const headerToMonth = async () => {
     const t = (await header.textContent())?.trim() ?? '';
     const m = /([A-Za-z]{3,})\s+(\d{4})/.exec(t);
     return m ? new Date(`${m[1]} 1, ${m[2]}`) : null;
   };
-
   const current = await headerToMonth();
-  let maxHops = 480; // default ~40y
-  let goNext: boolean | null = null;
+  let maxHops = 480, goNext: boolean | null = null;
   if (current) {
     const diff = (want.getFullYear() - current.getFullYear()) * 12 + (want.getMonth() - current.getMonth());
-    maxHops = Math.abs(diff) + 24; // 2y buffer
+    maxHops = Math.abs(diff) + 24;
     goNext = diff > 0;
   }
 
@@ -289,27 +332,69 @@ export async function setDate(page: Page, label: string, value: TargetDate) {
     const t = (await header.textContent())?.trim() ?? '';
     if (t.includes(long) || t.includes(short)) break;
 
-    if (goNext === null) goNext = true; // optimistic
+    if (goNext === null) goNext = true;
     if (goNext && (await next.count())) await next.click();
     else if (await prev.count()) await prev.click();
     else await cal.press(goNext ? 'PageDown' : 'PageUp');
-
     await cal.waitFor({ state: 'visible' });
   }
 
-  // Click the day
   const dayBtn = cal.getByRole('button', { name: new RegExp(`^${target.getDate()}$`) }).first()
-                .or(cal.locator('[role="gridcell"]').filter({ hasText: String(target.getDate()) }).first());
+    .or(cal.locator('[role="gridcell"]').filter({ hasText: String(target.getDate()) }).first());
   await expect(dayBtn).toBeVisible();
   await dayBtn.click();
+}
 
-  // Verify textbox value (accept AU or ISO display)
+/** Public: set a date in UCI whether it’s textbox-style or combobox-style */
+export async function setDate(page: Page, label: string, value: TargetDate) {
+  const target = parseDateLoose(value);
+  const { editableInput, comboOrText, openButton } = await findDateHandles(page, label);
+
+  // If there is an editable input, first try a clean type+commit path
+  if (editableInput) {
+    await editableInput.click();
+    // clear existing
+    await editableInput.fill('');
+    // AU format typing (UCI usually accepts typed values)
+    const dd = String(target.getDate()).padStart(2, '0');
+    const mm = String(target.getMonth() + 1).padStart(2, '0');
+    const yyyy = target.getFullYear();
+    const au = `${dd}/${mm}/${yyyy}`;
+
+    await editableInput.type(au, { delay: 20 });
+    // Commit value (Enter or Tab often triggers validation)
+    await editableInput.press('Enter').catch(() => {});
+    await editableInput.blur().catch(() => {});
+
+    // Verify; if it didn’t stick, fall back to calendar selection
+    const valueOk = await editableInput.evaluate((el: HTMLInputElement) => el.value).catch(() => '');
+    if (valueOk && (new RegExp(`${esc(au)}|${yyyy}-${mm}-${dd}`)).test(valueOk)) {
+      return;
+    }
+  }
+
+  // Either there was no editable input, or typing didn’t commit correctly -> use calendar
+  await comboOrText.click().catch(() => {});
+  if (openButton && (await openButton.isVisible().catch(() => false))) {
+    await openButton.click();
+  } else {
+    // keyboard open (Alt+ArrowDown often works)
+    await comboOrText.press('Alt+ArrowDown').catch(() => {});
+  }
+  await pickFromCalendar(page, target);
+
+  // Final verification (read from whichever input we have; else check combobox text)
   const dd = String(target.getDate()).padStart(2, '0');
   const mm = String(target.getMonth() + 1).padStart(2, '0');
   const yyyy = target.getFullYear();
-  const au = `${dd}/${mm}/${yyyy}`;
-  const iso = `${yyyy}-${mm}-${dd}`;
-  await expect(tb).toHaveValue(new RegExp(`${esc(au)}|${esc(iso)}`));
+  const rx = new RegExp(`${esc(`${dd}/${mm}/${yyyy}`)}|${esc(`${yyyy}-${mm}-${dd}`)}`);
+
+  if (editableInput) {
+    await expect(editableInput).toHaveValue(rx);
+  } else {
+    // Some combobox variants render the value as text content
+    await expect(comboOrText).toHaveText(rx);
+  }
 }
 
 /* ------------------------- toolbar & notifications ----------------------- */
