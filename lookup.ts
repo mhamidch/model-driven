@@ -6,35 +6,46 @@ const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 /** Build a case-insensitive exact-match regex for an accessible name */
 const labelRx = (label: string) => new RegExp(`^${esc(label)}$`, 'i');
 
+/** Tiny helper: check visibility with a timeout (works cross-platform) */
+async function visibleWithin(loc: Locator, timeout = 1000): Promise<boolean> {
+  try {
+    await expect(loc).toBeVisible({ timeout });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Find a lookup input by its field label (Model-Driven Apps expose as textbox/combobox) */
 async function findLookup(page: Page, label: string) {
-  const cb = page.getByRole(/^(combobox|textbox)$/i, { name: labelRx(label) }).first();
+  // Try combobox first
+  let cb = page.getByRole('combobox', { name: labelRx(label) }).first();
+  if (await cb.count() === 0) {
+    // Fall back to textbox if no combobox found
+    cb = page.getByRole('textbox', { name: labelRx(label) }).first();
+  }
   await expect(cb, `Lookup "${label}" should exist`).toBeVisible();
   return cb;
 }
 
 /** Try to remove any existing chips/pills/value from a lookup input */
 async function clearLookupValue(input: Locator) {
+  try { await input.click(); } catch {}
+  // Windows uses Control, macOS uses Meta; try both, harmless if one fails
   try { await input.press('Control+A'); } catch {}
+  try { await input.press('Meta+A'); } catch {}
   try { await input.press('Backspace'); } catch {}
-  // Some controls ignore Backspace until focused via click
-  try { await input.click({ position: { x: 5, y: 10 } }); } catch {}
   try { await input.fill(''); } catch {}
 }
 
 /** Robust wait for Dataverse search calls to return (reduces flakiness) */
 async function waitForDataverseSearch(page: Page, timeout: number) {
-  // Typical lookup search calls hit /api/data/v9.x/... endpoints
-  // We wait for at least one response after typing/opening the list.
-  await page.waitForResponse(
-    (res) => {
-      const url = res.url();
-      const ok = /\/api\/data\/v9\.\d+\/.+/i.test(url);
-      // Only count successful responses to avoid returning too early
-      return ok && res.status() < 500;
-    },
-    { timeout }
-  ).catch(() => {});
+  await page
+    .waitForResponse(
+      (res) => /\/api\/data\/v9\.\d+\/.+/i.test(res.url()) && res.status() < 500,
+      { timeout }
+    )
+    .catch(() => {});
 }
 
 /**
@@ -48,10 +59,14 @@ async function pickFromLookupDialog(
   { timeout = 15000, allowStartsWith = true }: { timeout?: number; allowStartsWith?: boolean } = {}
 ) {
   // Try a nearby "Look up more records" button
-  const container = input.locator('xpath=ancestor::*[self::div or self::section][@role="group" or contains(@class,"")][1]');
-  const moreBtn = container.getByRole('button', { name: /look\s*up|more\s*records|search\s*for\s*more/i }).first();
+  const container = input.locator(
+    'xpath=ancestor::*[self::div or self::section][@role="group" or contains(@class,"")][1]'
+  );
+  const moreBtn = container.getByRole('button', {
+    name: /look\s*up|more\s*records|search\s*for\s*more/i,
+  }).first();
 
-  if (await moreBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
+  if (await visibleWithin(moreBtn, 1000)) {
     await moreBtn.click();
   } else {
     // Keyboard gesture often opens the chooser
@@ -63,11 +78,12 @@ async function pickFromLookupDialog(
   await expect(dlg, 'Lookup dialog should open').toBeVisible({ timeout });
 
   // Search box (often "Search this view")
-  const dlgSearch =
-    dlg.getByRole('textbox', { name: /search/i }).first()
-      .or(dlg.getByPlaceholder(/search/i));
+  const dlgSearch = dlg
+    .getByRole('textbox', { name: /search/i })
+    .first()
+    .or(dlg.getByPlaceholder(/search/i));
 
-  if (await dlgSearch.isVisible().catch(() => false)) {
+  if (await visibleWithin(dlgSearch, 1000)) {
     await dlgSearch.fill(value);
     await dlgSearch.press('Enter').catch(() => {});
   }
@@ -78,7 +94,7 @@ async function pickFromLookupDialog(
   const startsRx = new RegExp(`^${esc(value)}`, 'i');
 
   let row = grid.getByRole('row', { name: exactRx }).first();
-  if (!(await row.isVisible({ timeout: 5000 }).catch(() => false)) && allowStartsWith) {
+  if (!(await visibleWithin(row, 5000)) && allowStartsWith) {
     row = grid.getByRole('row', { name: startsRx }).first();
   }
   await expect(row, `Row for "${value}" should appear in lookup grid`).toBeVisible({ timeout: 5000 });
@@ -86,7 +102,7 @@ async function pickFromLookupDialog(
   // Double-click to select; fall back to checkbox + Add/OK
   await row.dblclick().catch(async () => {
     const checkbox = row.getByRole('checkbox').first();
-    if (await checkbox.isVisible().catch(() => false)) {
+    if (await visibleWithin(checkbox, 500)) {
       await checkbox.check();
       await dlg.getByRole('button', { name: /add|ok|select/i }).click();
     } else {
@@ -111,7 +127,7 @@ export async function selectLookupValue(
     timeout?: number;
     exact?: boolean;
     dialogStartsWith?: boolean;
-    scrollPages?: number;     // how many "pages" to attempt in the listbox before dialog
+    scrollPages?: number; // how many "pages" to attempt in the listbox before dialog
     openWithArrowDown?: boolean;
   } = {}
 ) {
@@ -145,40 +161,39 @@ export async function selectLookupValue(
 
   // Options usually live in a role="listbox" container
   const listboxes = page.getByRole('listbox');
-  const listbox = (await listboxes.count()) > 0 ? listboxes.last() : input.locator('[role="listbox"]').last();
+  const lbCount = await listboxes.count();
+  const listbox = lbCount > 0 ? listboxes.nth(lbCount - 1) : input.locator('[role="listbox"]').last();
 
-  // Build option locators (exact first, then startsWith for truncated names)
   const exactRx = new RegExp(`^${esc(value)}$`, 'i');
   const startsRx = new RegExp(`^${esc(value)}`, 'i');
 
   let option = listbox.getByRole('option', { name: exactRx }).first();
 
   // If visible quickly, click and return
-  if (await option.isVisible({ timeout: 1000 }).catch(() => false)) {
+  if (await visibleWithin(option, 1000)) {
     await option.click();
     return;
   }
 
   // Try startsWith (UI may ellipsis-truncate)
   if (!exact) {
-    option = listbox.getByRole('option', { name: startsRx }).first();
-    if (await option.isVisible({ timeout: 1000 }).catch(() => false)) {
-      await option.click();
+    const opt2 = listbox.getByRole('option', { name: startsRx }).first();
+    if (await visibleWithin(opt2, 1000)) {
+      await opt2.click();
       return;
     }
   }
 
   // If still not visible, attempt to scroll the virtualized listbox a few "pages"
   for (let i = 0; i < scrollPages; i++) {
-    // Scroll by the visible height to simulate a page down
     await listbox.evaluate((e: HTMLElement) => e.scrollBy(0, e.clientHeight));
-    if (await option.isVisible({ timeout: 500 }).catch(() => false)) {
+    if (await visibleWithin(option, 500)) {
       await option.click();
       return;
     }
     if (!exact) {
       const opt2 = listbox.getByRole('option', { name: startsRx }).first();
-      if (await opt2.isVisible({ timeout: 300 }).catch(() => false)) {
+      if (await visibleWithin(opt2, 300)) {
         await opt2.click();
         return;
       }
@@ -186,7 +201,10 @@ export async function selectLookupValue(
   }
 
   // Escalate to dialog as the reliable fallback
-  await pickFromLookupDialog(page, input, value, { timeout, allowStartsWith: dialogStartsWith });
+  await pickFromLookupDialog(page, input, value, {
+    timeout,
+    allowStartsWith: dialogStartsWith,
+  });
 }
 
 /**
@@ -202,5 +220,8 @@ export async function forceLookupDialogSelection(
   const input = await findLookup(page, label);
   await input.click();
   await clearLookupValue(input);
-  await pickFromLookupDialog(page, input, value, { timeout, allowStartsWith: dialogStartsWith });
+  await pickFromLookupDialog(page, input, value, {
+    timeout,
+    allowStartsWith: dialogStartsWith,
+  });
 }
